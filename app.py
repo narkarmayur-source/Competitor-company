@@ -1,24 +1,30 @@
 import streamlit as st
 import pandas as pd
-import time
 import requests
+import time
 import google.generativeai as genai
 from duckduckgo_search import DDGS
 
 st.set_page_config(layout="wide")
-st.title("Deep Search B2B Lead Generator")
+st.title("AI Sales Agent (Apollo + Gemini)")
 
-# Connect to Gemini securely
-try:
-    genai.configure(api_key=st.secrets["GEMINI_API_KEY"])
+# Securely load both API keys
+apollo_key = st.secrets.get("APOLLO_API_KEY")
+gemini_key = st.secrets.get("GEMINI_API_KEY")
+
+# Initialize Gemini if the key is present
+if gemini_key:
+    genai.configure(api_key=gemini_key)
     model = genai.GenerativeModel('gemini-1.5-flash')
-    ai_ready = True
-except Exception as e:
-    ai_ready = False
-    st.error("⚠️ AI Key not found. Please add GEMINI_API_KEY to your Streamlit Secrets.")
+else:
+    st.error("⚠️ GEMINI_API_KEY is missing from Streamlit Secrets.")
 
-st.write("### 1. Upload your list")
-uploaded_file = st.file_uploader("Choose a CSV file", type=["csv"])
+st.write("### 1. Configure Your Pitch")
+st.caption("Tell the AI what you are selling so it can write your emails.")
+my_pitch = st.text_area("Product/Service Description:", "A software tool that helps HR teams automate their candidate sourcing process.")
+
+st.write("### 2. Upload your list")
+uploaded_file = st.file_uploader("Choose a CSV file containing company names", type=["csv"])
 
 def find_company_column(df):
     possible_names = ['company', 'organization', 'account', 'client', 'name', 'employer', 'brand']
@@ -27,18 +33,10 @@ def find_company_column(df):
             return col
     return df.columns[0]
 
-def verify_link(url):
-    try:
-        headers = {'User-Agent': 'Mozilla/5.0'}
-        response = requests.get(url, headers=headers, timeout=5)
-        return response.status_code == 200
-    except:
-        return False
-
-# Initialize the spreadsheet
+# Initialize spreadsheet with the new Draft Email column
 if "df" not in st.session_state:
     st.session_state.df = pd.DataFrame(
-        columns=["Company", "Careers Page", "Contact Name", "LinkedIn Profile", "Email Guess", "Status", "My Notes"]
+        columns=["Company", "Careers Page", "Contact Name", "Job Title", "Contact Email", "LinkedIn Profile", "Draft Email", "Status", "My Notes"]
     )
 
 if uploaded_file is not None and "file_loaded" not in st.session_state:
@@ -46,88 +44,119 @@ if uploaded_file is not None and "file_loaded" not in st.session_state:
     company_col = find_company_column(uploaded_df)
     uploaded_df.rename(columns={company_col: "Company"}, inplace=True)
     
-    for col in ["Careers Page", "Contact Name", "LinkedIn Profile", "Email Guess", "Status", "My Notes"]:
+    for col in ["Careers Page", "Contact Name", "Job Title", "Contact Email", "LinkedIn Profile", "Draft Email", "Status", "My Notes"]:
         if col not in uploaded_df.columns:
             uploaded_df[col] = ""
             
     st.session_state.df = uploaded_df
     st.session_state.file_loaded = True
 
-def enrich_data(df):
-    ddgs = DDGS()
+def get_careers_page(company):
+    try:
+        ddgs = DDGS()
+        results = ddgs.text(f'"{company}" official site careers OR jobs', max_results=1)
+        if results:
+            return results[0]['href']
+    except:
+        pass
+    return ""
+
+def search_apollo(company_name, api_key):
+    url = "https://api.apollo.io/v1/mixed_people/search"
+    headers = {
+        'Cache-Control': 'no-cache',
+        'Content-Type': 'application/json',
+        'X-Api-Key': api_key
+    }
+    payload = {
+        "q_keywords": company_name,
+        "person_titles": ["HR", "Recruiter", "Human Resources", "Talent Acquisition", "Talent", "HR Manager"],
+        "per_page": 1
+    }
+    
+    try:
+        response = requests.post(url, headers=headers, json=payload, timeout=10)
+        if response.status_code == 200:
+            data = response.json()
+            if 'people' in data and len(data['people']) > 0:
+                return data['people'][0]
+            elif 'contacts' in data and len(data['contacts']) > 0:
+                return data['contacts'][0]
+    except Exception as e:
+        pass
+    return None
+
+def write_email(name, title, company, pitch):
+    prompt = f"""
+    Write a concise, 3-sentence B2B cold email to {name}, who is the {title} at {company}.
+    Context: I am selling {pitch}.
+    Goal: Get them interested in a quick chat.
+    Tone: Professional, direct, and completely natural. 
+    Rule: Do not include a Subject line. Do not include placeholder brackets like [Your Name]. Just write the core email body.
+    """
+    try:
+        response = model.generate_content(prompt)
+        return response.text.strip()
+    except:
+        return "Error generating email."
+
+def enrich_data(df, ap_key, pitch_text):
     for index, row in df.iterrows():
         company = str(row["Company"]).strip()
         
         if pd.isna(company) or company == "":
             continue
             
-        st.toast(f"Extensive search started for {company}...")
+        st.toast(f"Extracting data & writing email for {company}...")
         
-        # AGENT TASK 1: Find Careers Page
+        # 1. Get Careers Page
         if pd.isna(row["Careers Page"]) or str(row["Careers Page"]).strip() == "":
-            try:
-                c_results = ddgs.text(f'{company} official site careers OR jobs', max_results=3)
-                for result in c_results:
-                    if verify_link(result['href']):
-                        df.at[index, "Careers Page"] = result['href']
-                        break
-            except:
-                pass
-            time.sleep(2)
+            df.at[index, "Careers Page"] = get_careers_page(company)
+            time.sleep(1)
             
-        # AGENT TASK 2: Deep LinkedIn Search
-        if ai_ready and (pd.isna(row["Contact Name"]) or str(row["Contact Name"]).strip() == ""):
-            try:
-                # Broadened the search query and increased max_results to 10
-                search_query = f'{company} (HR OR Recruiter OR "Talent Acquisition" OR "Human Resources") site:linkedin.com/in/'
-                li_results = ddgs.text(search_query, max_results=10)
+        # 2. Get Apollo Data
+        if pd.isna(row["Contact Name"]) or str(row["Contact Name"]).strip() == "":
+            person = search_apollo(company, ap_key)
+            
+            if person:
+                first_name = person.get('first_name', '')
+                last_name = person.get('last_name', '')
+                name = f"{first_name} {last_name}".strip()
+                title = person.get('title', '')
                 
-                match_found = False
-                if li_results:
-                    for result in li_results:
-                        snippet = str(result['body'])
-                        title = str(result['title'])
-                        
-                        # Gemini Prompt is now more forgiving
-                        prompt = f"""
-                        You are a lead generation assistant. 
-                        Read this LinkedIn profile search snippet: "{snippet}" and Title: "{title}"
-                        Does this text suggest this person currently works in HR, Recruiting, or Talent Acquisition at a company related to '{company}'?
-                        Reply with EXACTLY the word YES or NO.
-                        """
-                        
-                        ai_response = model.generate_content(prompt).text.strip().upper()
-                        
-                        if "YES" in ai_response:
-                            # Extract name cleanly
-                            clean_name = title.split('-')[0].split('|')[0].replace('LinkedIn', '').strip()
-                            df.at[index, "Contact Name"] = clean_name
-                            df.at[index, "LinkedIn Profile"] = result['href']
-                            
-                            # Guess Email
-                            domain = str(df.at[index, "Careers Page"]).split('/')[2].replace('www.', '') if not pd.isna(df.at[index, "Careers Page"]) and df.at[index, "Careers Page"] != "" else "company.com"
-                            df.at[index, "Email Guess"] = f"{clean_name.lower().replace(' ', '.')}@{domain}"
-                            
-                            match_found = True
-                            st.toast(f"✅ Found contact for {company}!")
-                            break # Found a match, stop looking through the 10 results
-                            
-                if not match_found:
-                    st.toast(f"⚠️ Checked 10 profiles for {company} but found no exact HR match.")
-            except Exception as e:
-                st.toast(f"Error searching {company}: {e}")
-                pass
-            time.sleep(3) # Pause longer to avoid getting blocked during deep searches
+                df.at[index, "Contact Name"] = name
+                df.at[index, "Job Title"] = title
+                df.at[index, "LinkedIn Profile"] = person.get('linkedin_url', '')
+                
+                apollo_email = person.get('email', '')
+                if apollo_email and apollo_email != "":
+                    df.at[index, "Contact Email"] = apollo_email
+                else:
+                    domain = str(df.at[index, "Careers Page"]).split('/')[2].replace('www.', '') if df.at[index, "Careers Page"] != "" else "company.com"
+                    df.at[index, "Contact Email"] = f"{first_name.lower()}.{last_name.lower()}@{domain}"
+                
+                # 3. Ask Gemini to write the custom email
+                if gemini_key:
+                    df.at[index, "Draft Email"] = write_email(name, title, company, pitch_text)
+                
+                st.toast(f"✅ Full profile and email generated for {company}")
+            else:
+                st.toast(f"⚠️ No HR match found on Apollo for {company}")
+                
+            time.sleep(1.5)
             
     return df
 
-st.write("### 2. Run the Agent")
-if st.button("Run AI Agent (Deep Search)", type="primary"):
-    with st.spinner("Executing deep search and AI verification... this will take a moment."):
-        st.session_state.df = enrich_data(st.session_state.df)
-        st.success("Deep search complete!")
+st.write("### 3. Run the Agent")
+if not apollo_key:
+    st.error("⚠️ APOLLO_API_KEY is missing from Streamlit Secrets.")
+else:
+    if st.button("Fetch Leads & Write Emails", type="primary"):
+        with st.spinner("Extracting data and generating AI emails..."):
+            st.session_state.df = enrich_data(st.session_state.df, apollo_key, my_pitch)
+            st.success("Complete! Scroll down to see your drafts.")
 
-st.write("### 3. Your Leads Database")
+st.write("### 4. Your Leads Database")
 st.session_state.df = st.data_editor(
     st.session_state.df,
     num_rows="dynamic",
@@ -136,8 +165,8 @@ st.session_state.df = st.data_editor(
 
 csv = st.session_state.df.to_csv(index=False).encode('utf-8')
 st.download_button(
-    label="Download Updated Spreadsheet",
+    label="Download Complete Spreadsheet",
     data=csv,
-    file_name='deep_search_leads.csv',
+    file_name='ai_sales_leads.csv',
     mime='text/csv',
 )
