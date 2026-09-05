@@ -6,12 +6,11 @@ import google.generativeai as genai
 from duckduckgo_search import DDGS
 
 st.set_page_config(layout="wide")
-st.title("AI-Powered B2B Lead Generator")
+st.title("Deep Search B2B Lead Generator")
 
-# Connect to Gemini securely using Streamlit Secrets
+# Connect to Gemini securely
 try:
     genai.configure(api_key=st.secrets["GEMINI_API_KEY"])
-    # We use Gemini 1.5 Flash because it is incredibly fast and free
     model = genai.GenerativeModel('gemini-1.5-flash')
     ai_ready = True
 except Exception as e:
@@ -62,12 +61,12 @@ def enrich_data(df):
         if pd.isna(company) or company == "":
             continue
             
-        st.toast(f"AI researching {company}...")
+        st.toast(f"Extensive search started for {company}...")
         
         # AGENT TASK 1: Find Careers Page
         if pd.isna(row["Careers Page"]) or str(row["Careers Page"]).strip() == "":
             try:
-                c_results = ddgs.text(f'"{company}" official site careers OR jobs', max_results=2)
+                c_results = ddgs.text(f'{company} official site careers OR jobs', max_results=3)
                 for result in c_results:
                     if verify_link(result['href']):
                         df.at[index, "Careers Page"] = result['href']
@@ -76,43 +75,57 @@ def enrich_data(df):
                 pass
             time.sleep(2)
             
-        # AGENT TASK 2: Find HR & Ask Gemini to Verify
+        # AGENT TASK 2: Deep LinkedIn Search
         if ai_ready and (pd.isna(row["Contact Name"]) or str(row["Contact Name"]).strip() == ""):
             try:
-                li_results = ddgs.text(f'site:linkedin.com/in/ "{company}" HR OR Recruiter', max_results=3)
-                for result in li_results:
-                    snippet = str(result['body'])
-                    
-                    # Ask Gemini to read the search result and verify it
-                    prompt = f"""
-                    You are a lead generation assistant. 
-                    Read this LinkedIn profile search snippet: "{snippet}"
-                    Does this text indicate that this person currently works in HR, Talent, or Recruiting at the company '{company}'?
-                    Reply with EXACTLY the word YES or NO.
-                    """
-                    
-                    ai_response = model.generate_content(prompt).text.strip().upper()
-                    
-                    if "YES" in ai_response:
-                        title = result['title']
-                        name = title.split('-')[0].split('|')[0].strip()
-                        df.at[index, "Contact Name"] = name
-                        df.at[index, "LinkedIn Profile"] = result['href']
+                # Broadened the search query and increased max_results to 10
+                search_query = f'{company} (HR OR Recruiter OR "Talent Acquisition" OR "Human Resources") site:linkedin.com/in/'
+                li_results = ddgs.text(search_query, max_results=10)
+                
+                match_found = False
+                if li_results:
+                    for result in li_results:
+                        snippet = str(result['body'])
+                        title = str(result['title'])
                         
-                        domain = str(df.at[index, "Careers Page"]).split('/')[2].replace('www.', '') if not pd.isna(df.at[index, "Careers Page"]) and df.at[index, "Careers Page"] != "" else "company.com"
-                        df.at[index, "Email Guess"] = f"{name.lower().replace(' ', '.')}@{domain}"
-                        break # Found a verified match, stop looking
-            except:
+                        # Gemini Prompt is now more forgiving
+                        prompt = f"""
+                        You are a lead generation assistant. 
+                        Read this LinkedIn profile search snippet: "{snippet}" and Title: "{title}"
+                        Does this text suggest this person currently works in HR, Recruiting, or Talent Acquisition at a company related to '{company}'?
+                        Reply with EXACTLY the word YES or NO.
+                        """
+                        
+                        ai_response = model.generate_content(prompt).text.strip().upper()
+                        
+                        if "YES" in ai_response:
+                            # Extract name cleanly
+                            clean_name = title.split('-')[0].split('|')[0].replace('LinkedIn', '').strip()
+                            df.at[index, "Contact Name"] = clean_name
+                            df.at[index, "LinkedIn Profile"] = result['href']
+                            
+                            # Guess Email
+                            domain = str(df.at[index, "Careers Page"]).split('/')[2].replace('www.', '') if not pd.isna(df.at[index, "Careers Page"]) and df.at[index, "Careers Page"] != "" else "company.com"
+                            df.at[index, "Email Guess"] = f"{clean_name.lower().replace(' ', '.')}@{domain}"
+                            
+                            match_found = True
+                            st.toast(f"✅ Found contact for {company}!")
+                            break # Found a match, stop looking through the 10 results
+                            
+                if not match_found:
+                    st.toast(f"⚠️ Checked 10 profiles for {company} but found no exact HR match.")
+            except Exception as e:
+                st.toast(f"Error searching {company}: {e}")
                 pass
-            time.sleep(2)
+            time.sleep(3) # Pause longer to avoid getting blocked during deep searches
             
     return df
 
 st.write("### 2. Run the Agent")
-if st.button("Run AI Agent (Gemini Verified)", type="primary"):
-    with st.spinner("Gemini is analyzing search results... Please wait."):
+if st.button("Run AI Agent (Deep Search)", type="primary"):
+    with st.spinner("Executing deep search and AI verification... this will take a moment."):
         st.session_state.df = enrich_data(st.session_state.df)
-        st.success("Analysis complete!")
+        st.success("Deep search complete!")
 
 st.write("### 3. Your Leads Database")
 st.session_state.df = st.data_editor(
@@ -125,6 +138,6 @@ csv = st.session_state.df.to_csv(index=False).encode('utf-8')
 st.download_button(
     label="Download Updated Spreadsheet",
     data=csv,
-    file_name='gemini_b2b_leads.csv',
+    file_name='deep_search_leads.csv',
     mime='text/csv',
 )
