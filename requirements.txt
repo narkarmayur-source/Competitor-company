@@ -1,3 +1,5 @@
 streamlit
 pandas
 duckduckgo-search
+requests
+google-generativeai
